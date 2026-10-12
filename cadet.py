@@ -7,7 +7,6 @@
 только кнопкой «Завершить досрочно» в самом тесте.
 """
 import json
-import os
 import queue
 import socket
 import sys
@@ -16,7 +15,8 @@ import time
 import tkinter as tk
 
 DEFAULT_PORT = 5050
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".testing_system_student.json")
+DISCOVERY_PORT = 5050            # UDP-порт для поиска преподавателя в сети
+DISCOVERY_MAGIC = "testing-system/1"
 
 # ---- оформление (без внешних зависимостей) ----
 FONT = "Segoe UI"
@@ -46,21 +46,20 @@ def font(size, weight="normal"):
     return (FONT, size, weight)
 
 
-def load_config():
+def local_ips():
+    ips = set()
     try:
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return {"host": str(data.get("host", ""))}
-    except (OSError, ValueError, AttributeError):
-        return {}
-
-
-def save_config(data):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
     except OSError:
         pass
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    return sorted(i for i in ips if not i.startswith("127."))
 
 
 def parse_address(text):
@@ -198,6 +197,80 @@ class KeyboardBlocker:
             user32.UnhookWindowsHookEx(hook)
 
 
+class TeacherFinder:
+    """Ищет программу преподавателя в локальной сети.
+
+    Раз в 2 секунды рассылает широковещательный UDP-запрос «кто проводит
+    тест?» и собирает ответы. Брандмауэр Windows по умолчанию 3 секунды
+    пропускает ответ на такой запрос, поэтому на компьютерах студентов ничего
+    настраивать не нужно. Через маршрутизаторы широковещание не проходит —
+    тогда студент вводит адрес вручную.
+    """
+
+    INTERVAL = 2.0
+
+    def __init__(self, on_found):
+        self.on_found = on_found          # вызывается из фонового потока!
+        self._stop = threading.Event()
+        self._stop.set()
+
+    def start(self):
+        if not self._stop.is_set():
+            return
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, args=(self._stop,), daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    @staticmethod
+    def _targets():
+        # общий широковещательный адрес + адрес «x.y.z.255» каждой сети компьютера
+        # (с несколькими сетевыми картами Windows шлёт 255.255.255.255 только в одну)
+        targets = {"255.255.255.255", "127.0.0.1"}
+        for ip in local_ips():
+            targets.add(ip.rsplit(".", 1)[0] + ".255")
+        return targets
+
+    def _run(self, stop):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.settimeout(0.3)
+        except OSError:
+            return
+        query = json.dumps({"type": "discover", "magic": DISCOVERY_MAGIC}).encode("utf-8")
+        with s:
+            while not stop.is_set():
+                for target in self._targets():
+                    try:
+                        s.sendto(query, (target, DISCOVERY_PORT))
+                    except OSError:
+                        pass
+                until = time.monotonic() + self.INTERVAL
+                while not stop.is_set() and time.monotonic() < until:
+                    try:
+                        data, addr = s.recvfrom(4096)
+                        msg = json.loads(data.decode("utf-8"))
+                    except socket.timeout:
+                        continue
+                    except (OSError, ValueError):
+                        # Windows сообщает «порт недоступен» на прошлую отправку — не страшно
+                        time.sleep(0.05)
+                        continue
+                    if not (isinstance(msg, dict) and msg.get("magic") == DISCOVERY_MAGIC
+                            and msg.get("type") == "here"):
+                        continue
+                    try:
+                        found = {"id": str(msg["id"]), "host": addr[0], "port": int(msg["port"]),
+                                 "title": str(msg.get("title") or "Тест"),
+                                 "computer": str(msg.get("computer") or addr[0]),
+                                 "started": bool(msg.get("started"))}
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    self.on_found(found)
+
+
 class FlatButton(tk.Label):
     """Плоская кнопка с подсветкой при наведении (не забирает фокус клавиатуры)."""
 
@@ -281,7 +354,10 @@ class CadetApp:
         self.inbox = queue.Queue()
         self.sock = None
         self.address = None              # (хост, порт) для переподключения
-        self.form = load_config()        # что было введено на экране входа
+        self.form = {}                   # что было введено на экране входа
+        self.found = {}                  # найденные в сети преподаватели: id -> сведения
+        self.selected = None             # id выбранного преподавателя
+        self.manual = False              # адрес вводится вручную
         self.screen = None
         self.test = None
         self.answers = {}
@@ -306,6 +382,7 @@ class CadetApp:
         self._toast = None
         self._toast_job = None
         self._last_key_toast = 0.0
+        self.finder = TeacherFinder(lambda m: self.inbox.put(dict(m, type="_found")))
         self.keyboard = KeyboardBlocker(lambda: self.inbox.put({"type": "_key_blocked"}))
 
         self.container = tk.Frame(root, bg=BG)
@@ -461,8 +538,9 @@ class CadetApp:
 
     # ---------- экран входа ----------
     def _field(self, parent, label, value, hint=None):
-        tk.Label(parent, text=label, font=font(11, "bold"), bg=SURFACE, fg=TEXT).pack(
-            anchor="w", pady=(12, 4))
+        if label:
+            tk.Label(parent, text=label, font=font(11, "bold"), bg=SURFACE, fg=TEXT).pack(
+                anchor="w", pady=(12, 4))
         e = tk.Entry(parent, width=34, font=font(13), relief="flat", bg="#f7f9fc", fg=TEXT,
                      insertbackground=TEXT, highlightthickness=2,
                      highlightbackground=BORDER, highlightcolor=PRIMARY)
@@ -473,6 +551,12 @@ class CadetApp:
                 anchor="w", pady=(4, 0))
         return e
 
+    def _link(self, parent, text, command):
+        lbl = tk.Label(parent, text=text, font=font(10, "underline"), bg=SURFACE, fg=PRIMARY,
+                       cursor="hand2")
+        lbl.bind("<Button-1>", lambda _e: command())
+        return lbl
+
     def show_login(self, error=None):
         self.unlock()
         self.close_modal()
@@ -482,25 +566,115 @@ class CadetApp:
         box = self.centered_card()
         tk.Label(box, text="Вход в тестирование", font=font(22, "bold"),
                  bg=SURFACE, fg=TEXT).pack(anchor="w")
-        tk.Label(box, text="Заполните поля и нажмите «Подключиться»", font=font(12),
+        tk.Label(box, text="Введите ФИО и группу и нажмите «Подключиться»", font=font(12),
                  bg=SURFACE, fg=MUTED).pack(anchor="w", pady=(4, 8))
 
         self.e_name = self._field(box, "Фамилия, имя, отчество", self.form.get("name", ""))
         self.e_group = self._field(box, "Группа", self.form.get("group", ""))
-        self.e_host = self._field(box, "Адрес преподавателя", self.form.get("host", ""),
-                                  hint="Написан на экране преподавателя, например 192.168.0.10")
+        tk.Label(box, text="Тест", font=font(11, "bold"), bg=SURFACE, fg=TEXT).pack(
+            anchor="w", pady=(12, 4))
+        self.server_box = tk.Frame(box, bg=SURFACE)
+        self.server_box.pack(fill="x")
+        self.e_host = None
+        self._servers_sig = None
+        self._render_servers()
+
         self.lbl_error = tk.Label(box, text=error or "", font=font(11), bg=SURFACE, fg=DANGER,
                                   wraplength=400, justify="left")
         self.lbl_error.pack(anchor="w", pady=(12, 0))
         self.btn_connect = FlatButton(box, "Подключиться", self.connect)
         self.btn_connect.pack(fill="x", pady=(10, 0))
 
-        for e in (self.e_name, self.e_group, self.e_host):
-            if not e.get():
-                e.focus_set()
-                break
-        else:
-            self.e_name.focus_set()
+        (self.e_group if self.e_name.get() and not self.e_group.get() else self.e_name).focus_set()
+        self.finder.start()
+        self._expire_servers()
+
+    # --- выбор преподавателя: найденные в сети или адрес вручную ---
+    def _on_found(self, m):
+        old = self.found.get(m["id"])
+        # если тот же компьютер ответил и по сети, и через 127.0.0.1 — берём сетевой адрес
+        if old and old["host"] != m["host"] and m["host"].startswith("127."):
+            m = dict(m, host=old["host"])
+        m["seen"] = time.monotonic()
+        self.found[m["id"]] = m
+        if self.screen == "login":
+            self._render_servers()
+
+    def _expire_servers(self):
+        now = time.monotonic()
+        for sid in [s for s, v in self.found.items() if now - v["seen"] > 7]:
+            del self.found[sid]
+        self._render_servers()
+        self.later("expire", 1000, self._expire_servers)
+
+    def _set_manual(self, on):
+        self.manual = on
+        self._servers_sig = None
+        self._render_servers()
+        if on and self.e_host is not None:
+            self.e_host.focus_set()
+
+    def _select_server(self, sid):
+        self.selected = sid
+        self._render_servers()
+
+    def _render_servers(self):
+        if self.selected not in self.found:
+            self.selected = next(iter(self.found)) if len(self.found) == 1 else None
+        items = sorted(self.found.values(), key=lambda v: (v["title"], v["computer"]))
+        # при ручном вводе список не важен — иначе перерисовка стёрла бы набранный адрес
+        sig = ("manual",) if self.manual else (
+            self.selected, tuple((v["id"], v["title"], v["computer"], v["host"]) for v in items))
+        if sig == self._servers_sig:
+            return            # ничего не изменилось — не перерисовываем (без мигания)
+        self._servers_sig = sig
+        self._cancel("dots")
+        for w in self.server_box.winfo_children():
+            w.destroy()
+        box = self.server_box
+        if self.manual:
+            self.e_host = self._field(box, "", self.form.get("host", ""),
+                                      hint="Адрес написан на экране преподавателя, "
+                                           "например 192.168.0.10")
+            self._link(box, "← Найти преподавателя автоматически",
+                       lambda: self._set_manual(False)).pack(anchor="w", pady=(6, 0))
+            return
+        self.e_host = None
+        if not items:
+            row = tk.Frame(box, bg="#f7f9fc", highlightthickness=1,
+                           highlightbackground=BORDER, highlightcolor=BORDER)
+            row.pack(fill="x")
+            dots = tk.Label(row, font=font(12), bg="#f7f9fc", fg=TEXT, anchor="w")
+            dots.pack(fill="x", padx=14, pady=(10, 0))
+            self.animate_dots(dots, "Ищем преподавателя в сети")
+            tk.Label(row, text="Тест появится здесь, как только преподаватель запустит "
+                               "свою программу", font=font(10), bg="#f7f9fc", fg=MUTED,
+                     anchor="w", wraplength=380, justify="left").pack(
+                fill="x", padx=14, pady=(2, 10))
+        for v in items:
+            sel = v["id"] == self.selected
+            bg = PRIMARY_SOFT if sel else SURFACE
+            row = tk.Frame(box, bg=bg, highlightthickness=2, cursor="hand2",
+                           highlightbackground=PRIMARY if sel else BORDER,
+                           highlightcolor=PRIMARY if sel else BORDER)
+            row.pack(fill="x", pady=(0, 6))
+            mark = tk.Label(row, text="✓" if sel else "", width=2, font=font(13, "bold"),
+                            bg=bg, fg=PRIMARY)
+            mark.pack(side="left", padx=(8, 0))
+            txt = tk.Frame(row, bg=bg)
+            txt.pack(side="left", fill="x", expand=True, pady=8)
+            t1 = tk.Label(txt, text=v["title"], font=font(12, "bold"), bg=bg, fg=TEXT,
+                          anchor="w")
+            t1.pack(fill="x")
+            info = f"компьютер {v['computer']}  ·  {v['host']}"
+            if v.get("started"):
+                info += "  ·  тест уже идёт"
+            t2 = tk.Label(txt, text=info, font=font(10), bg=bg, fg=MUTED, anchor="w")
+            t2.pack(fill="x")
+            for w in (row, mark, txt, t1, t2):
+                w.bind("<Button-1>", lambda _e, sid=v["id"]: self._select_server(sid))
+        self._link(box, "Указать адрес вручную", lambda: self._set_manual(True)).pack(
+            anchor="w", pady=(6, 0))
 
     def _login_error(self, text, entry=None):
         self.lbl_error.config(text=text)
@@ -512,19 +686,30 @@ class CadetApp:
             return
         name = " ".join(self.e_name.get().split())
         group = self.e_group.get().strip()
-        raw = self.e_host.get().strip()
         if not name:
             return self._login_error("Введите фамилию, имя и отчество.", self.e_name)
         if not group:
             return self._login_error("Введите номер группы.", self.e_group)
-        if not raw:
-            return self._login_error("Введите адрес — его покажет преподаватель.", self.e_host)
-        try:
-            host, port = parse_address(raw)
-        except ValueError:
-            return self._login_error("Адрес указан неверно. Пример: 192.168.0.10", self.e_host)
+        if self.manual:
+            raw = self.e_host.get().strip()
+            if not raw:
+                return self._login_error("Введите адрес — его покажет преподаватель.",
+                                         self.e_host)
+            try:
+                host, port = parse_address(raw)
+            except ValueError:
+                return self._login_error("Адрес указан неверно. Пример: 192.168.0.10",
+                                         self.e_host)
+        else:
+            raw = self.form.get("host", "")
+            srv = self.found.get(self.selected)
+            if srv is None:
+                return self._login_error(
+                    "Выберите тест в списке." if self.found else
+                    "Преподаватель пока не найден. Подождите несколько секунд "
+                    "или укажите адрес вручную.")
+            host, port = srv["host"], srv["port"]
         self.form = {"name": name, "group": group, "host": raw}
-        save_config({"host": raw})
         self.address = (host, port)
         self.lbl_error.config(text="")
         self.btn_connect.set_enabled(False)
@@ -830,6 +1015,7 @@ class CadetApp:
             self.quit()
 
     def quit(self):
+        self.finder.stop()
         self.keyboard.stop()
         self._drop_socket()
         self.root.destroy()
@@ -880,7 +1066,9 @@ class CadetApp:
 
     def handle(self, m):
         t = m.get("type")
-        if t == "_conn_ok":
+        if t == "_found":
+            self._on_found(m)
+        elif t == "_conn_ok":
             self._on_connected(m["sock"], m["purpose"])
         elif t == "_conn_fail":
             if m["purpose"] == "login":
@@ -938,6 +1126,7 @@ class CadetApp:
         threading.Thread(target=self.reader, args=(sock,), daemon=True).start()
         self.send({"type": "hello", "name": self.form["name"], "group": self.form["group"]})
         if purpose == "login":
+            self.finder.stop()
             self.show_wait()
         else:
             self._stop_reconnect()

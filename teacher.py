@@ -5,15 +5,38 @@
 Показывает в реальном времени прогресс каждого студента и выставляет оценки.
 """
 import csv
+import hashlib
+import hmac
 import json
 import socket
 import sys
 import threading
 import time
 import tkinter as tk
+import uuid
 from tkinter import filedialog, messagebox, ttk
 
 DEFAULT_PORT = 5050
+DISCOVERY_PORT = 5050            # UDP-порт, на котором студенты ищут преподавателя
+DISCOVERY_MAGIC = "testing-system/1"
+
+# Вход в программу преподавателя. В коде хранится не сам пароль, а его хеш
+# (PBKDF2) — по нему пароль проверяют, но обратно не получают.
+# Как сменить пароль — см. README, раздел «Вход для преподавателя».
+TEACHER_LOGIN = "Professor"
+PASSWORD_SALT = bytes.fromhex("a545d190748d0c12b6ce5f7e78b12327")
+PASSWORD_HASH = "f7b5a960f78febbcac9f72fe45b863b1c7d35b8fdd41d4c8643e964102091eac"
+
+
+def hash_password(password):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), PASSWORD_SALT,
+                               200_000).hex()
+
+
+def check_login(login, password):
+    """Логин — без учёта регистра, пароль — с учётом."""
+    login_ok = login.strip().lower() == TEACHER_LOGIN.lower()
+    return hmac.compare_digest(hash_password(password), PASSWORD_HASH) and login_ok
 DEFAULT_SCALE = {5: 90.0, 4: 75.0, 3: 50.0}  # % правильных ответов для оценки
 
 # ---- оформление ----
@@ -95,6 +118,7 @@ class TestServer:
         self.started = False
         self.t_started = None
         self.sock = None
+        self.instance_id = uuid.uuid4().hex   # чтобы студент не увидел одного учителя дважды
 
     # ---------- запуск ----------
     def start_listening(self):
@@ -103,6 +127,37 @@ class TestServer:
         self.sock.bind(("0.0.0.0", self.port))
         self.sock.listen(100)
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        self._start_discovery()
+
+    def _start_discovery(self):
+        """Отвечает на широковещательный запрос студентов «кто проводит тест?»."""
+        try:
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            u.bind(("0.0.0.0", DISCOVERY_PORT))
+        except OSError:
+            return   # без автопоиска студенты введут адрес вручную
+        threading.Thread(target=self._discovery_loop, args=(u,), daemon=True).start()
+
+    def _discovery_loop(self, u):
+        computer = socket.gethostname()
+        while True:
+            try:
+                data, addr = u.recvfrom(2048)
+                msg = json.loads(data.decode("utf-8"))
+            except (OSError, ValueError):
+                time.sleep(0.05)   # в т. ч. «порт недоступен» от Windows — просто ждём дальше
+                continue
+            if not (isinstance(msg, dict) and msg.get("magic") == DISCOVERY_MAGIC
+                    and msg.get("type") == "discover"):
+                continue
+            reply = {"type": "here", "magic": DISCOVERY_MAGIC, "id": self.instance_id,
+                     "port": self.port, "title": self.test.get("title", "Тест"),
+                     "computer": computer, "started": self.started}
+            try:
+                u.sendto(json.dumps(reply, ensure_ascii=False).encode("utf-8"), addr)
+            except OSError:
+                pass
 
     def _accept_loop(self):
         while True:
@@ -338,7 +393,9 @@ class TeacherApp:
         root.title("Преподаватель — контроль тестирования")
         root.configure(bg=BG)
         root.minsize(1000, 580)
-        root.geometry("1260x720")
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1260, sw - 40), min(720, sh - 80)
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._style()
@@ -388,7 +445,7 @@ class TeacherApp:
 
         right = tk.Frame(inner, bg=HEADER)
         right.pack(side="right")
-        tk.Label(right, text="АДРЕС ДЛЯ СТУДЕНТОВ", font=font(9, "bold"), bg=HEADER,
+        tk.Label(right, text="АДРЕС ДЛЯ РУЧНОГО ВВОДА", font=font(9, "bold"), bg=HEADER,
                  fg=HEADER_MUTED).pack(anchor="e")
         ips = local_ips()
         self.address = "  или  ".join(ips) if ips else "не найден"
@@ -453,8 +510,9 @@ class TeacherApp:
         self.empty = tk.Label(
             card, bg=SURFACE, fg=MUTED, font=font(13), justify="center",
             text="Пока никто не подключился\n\n"
-                 "Студенты запускают «Тестирование (студент)»,\n"
-                 f"вводят ФИО, группу и адрес  {self.address}")
+                 "Студенты запускают «Тестирование (студент)» — программа\n"
+                 "сама найдёт этот компьютер в сети. Если не нашла,\n"
+                 f"студент нажимает «Указать адрес вручную» и вводит  {self.address}")
 
         tk.Label(self.root, text="Двойной клик по студенту — его ответы.   "
                                  "«Нарушения» — сколько раз студент уходил из окна теста; "
@@ -704,9 +762,71 @@ def load_test(path):
     return test
 
 
+class LoginScreen(tk.Frame):
+    """Вход в программу преподавателя по логину и паролю."""
+
+    def __init__(self, root, on_success):
+        super().__init__(root, bg=BG)
+        self.root = root
+        self.on_success = on_success
+        root.title("Вход — программа преподавателя")
+        root.configure(bg=BG)
+        w, h = 480, 470
+        x = max(0, (root.winfo_screenwidth() - w) // 2)
+        y = max(0, (root.winfo_screenheight() - h) // 3)
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.minsize(420, 440)
+        self.pack(fill="both", expand=True)
+
+        card = tk.Frame(self, bg=SURFACE, highlightthickness=1,
+                        highlightbackground=BORDER, highlightcolor=BORDER)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        box = tk.Frame(card, bg=SURFACE)
+        box.pack(padx=40, pady=34)
+        tk.Label(box, text="Вход для преподавателя", font=font(19, "bold"), bg=SURFACE,
+                 fg=TEXT).pack(anchor="w")
+        tk.Label(box, text="Программа управления тестированием", font=font(11), bg=SURFACE,
+                 fg=MUTED).pack(anchor="w", pady=(2, 6))
+        self.e_login = self._field(box, "Логин")
+        self.e_password = self._field(box, "Пароль", show="•")
+        self.lbl_error = tk.Label(box, text="", font=font(11), bg=SURFACE, fg=DANGER)
+        self.lbl_error.pack(anchor="w", pady=(10, 0))
+        FlatButton(box, "Войти", self.submit, size=13, pady=11).pack(fill="x", pady=(6, 0))
+        root.bind("<Return>", lambda _e: self.submit())
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        self.e_login.focus_set()
+
+    @staticmethod
+    def _field(parent, label, show=""):
+        tk.Label(parent, text=label, font=font(11, "bold"), bg=SURFACE, fg=TEXT).pack(
+            anchor="w", pady=(12, 4))
+        e = tk.Entry(parent, width=30, font=font(13), relief="flat", bg="#f7f9fc", fg=TEXT,
+                     insertbackground=TEXT, highlightthickness=2, show=show,
+                     highlightbackground=BORDER, highlightcolor=PRIMARY)
+        e.pack(fill="x", ipady=7, ipadx=6)
+        return e
+
+    def submit(self):
+        if check_login(self.e_login.get(), self.e_password.get()):
+            self.root.unbind("<Return>")
+            self.destroy()
+            self.on_success()
+        else:
+            self.lbl_error.config(text="Неверный логин или пароль")
+            self.e_password.delete(0, "end")
+            self.e_password.focus_set()
+
+
 def main():
     root = tk.Tk()
-    root.withdraw()  # скрыть пустое окно на время выбора файла
+    LoginScreen(root, lambda: launch(root))
+    root.mainloop()
+
+
+def launch(root):
+    """После входа: загрузка вопросов, запуск сервера и главного окна."""
+    root.withdraw()  # скрыть окно на время выбора файла
+    root.minsize(1, 1)
 
     path = sys.argv[1] if len(sys.argv) > 1 else "questions.json"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_PORT
@@ -720,18 +840,18 @@ def main():
             filetypes=[("Файлы вопросов", "*.json"), ("Все файлы", "*.*")])
         if not chosen:
             messagebox.showinfo("Отмена", "Файл с вопросами не выбран. Программа закрыта.")
-            return
+            return root.destroy()
         path = chosen
     except Exception as e:
         messagebox.showerror("Ошибка", f"Не удалось загрузить вопросы из:\n{path}\n\n{e}")
-        return
+        return root.destroy()
 
     if test is None:
         try:
             test = load_test(path)
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить вопросы из:\n{path}\n\n{e}")
-            return
+            return root.destroy()
 
     server = TestServer(test, port)
     try:
@@ -739,11 +859,10 @@ def main():
     except OSError as e:
         messagebox.showerror("Ошибка", f"Не удалось открыть порт {port}:\n{e}\n\n"
                                        "Возможно, программа уже запущена.")
-        return
+        return root.destroy()
 
     root.deiconify()
     TeacherApp(root, server)
-    root.mainloop()
 
 
 if __name__ == "__main__":
