@@ -28,6 +28,21 @@ PASSWORD_SALT = bytes.fromhex("a545d190748d0c12b6ce5f7e78b12327")
 PASSWORD_HASH = "f7b5a960f78febbcac9f72fe45b863b1c7d35b8fdd41d4c8643e964102091eac"
 
 
+def exclusive_port(sock):
+    """UDP-порт автопоиска: на Windows SO_REUSEADDR позволил бы второй копии
+    программы молча делить порт — включаем монопольный режим, чтобы получить
+    честную ошибку «порт занят»."""
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
+def log(text):
+    """Служебные сообщения — в окно консоли, из которого запущена программа."""
+    print(time.strftime("%H:%M:%S"), text, file=sys.stderr, flush=True)
+
+
 def hash_password(password):
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), PASSWORD_SALT,
                                200_000).hex()
@@ -118,6 +133,8 @@ class TestServer:
         self.started = False
         self.t_started = None
         self.sock = None
+        self.discovery_error = None
+        self.discovery_seen = set()   # адреса, с которых приходили запросы автопоиска
         self.instance_id = uuid.uuid4().hex   # чтобы студент не увидел одного учителя дважды
 
     # ---------- запуск ----------
@@ -133,31 +150,42 @@ class TestServer:
         """Отвечает на широковещательный запрос студентов «кто проводит тест?»."""
         try:
             u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            u.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            exclusive_port(u)
             u.bind(("0.0.0.0", DISCOVERY_PORT))
-        except OSError:
-            return   # без автопоиска студенты введут адрес вручную
+        except OSError as e:
+            # без автопоиска студенты введут адрес вручную
+            self.discovery_error = str(e)
+            log(f"Автопоиск НЕ запущен: не удалось занять UDP-порт {DISCOVERY_PORT}: {e}")
+            return
+        log(f"Автопоиск запущен: жду запросы студентов на UDP-порту {DISCOVERY_PORT}")
         threading.Thread(target=self._discovery_loop, args=(u,), daemon=True).start()
 
     def _discovery_loop(self, u):
         computer = socket.gethostname()
+        seen = self.discovery_seen
         while True:
             try:
                 data, addr = u.recvfrom(2048)
                 msg = json.loads(data.decode("utf-8"))
-            except (OSError, ValueError):
-                time.sleep(0.05)   # в т. ч. «порт недоступен» от Windows — просто ждём дальше
+            except (OSError, ValueError) as e:
+                # в т. ч. «порт недоступен» от Windows на прошлый ответ — ждём дальше
+                if not isinstance(e, ConnectionResetError):
+                    log(f"Автопоиск: ошибка приёма: {e!r}")
+                time.sleep(0.05)
                 continue
             if not (isinstance(msg, dict) and msg.get("magic") == DISCOVERY_MAGIC
                     and msg.get("type") == "discover"):
                 continue
+            if addr[0] not in seen:
+                seen.add(addr[0])
+                log(f"Автопоиск: запрос от {addr[0]} — отвечаю")
             reply = {"type": "here", "magic": DISCOVERY_MAGIC, "id": self.instance_id,
                      "port": self.port, "title": self.test.get("title", "Тест"),
                      "computer": computer, "started": self.started}
             try:
                 u.sendto(json.dumps(reply, ensure_ascii=False).encode("utf-8"), addr)
-            except OSError:
-                pass
+            except OSError as e:
+                log(f"Автопоиск: не удалось ответить {addr[0]}: {e}")
 
     def _accept_loop(self):
         while True:
@@ -458,6 +486,8 @@ class TeacherApp:
         elif not ips:
             tk.Label(right, text="посмотрите IP-адрес в сетевых настройках Windows",
                      font=font(10), bg=HEADER, fg=HEADER_MUTED).pack(anchor="e")
+        self.lbl_discovery = tk.Label(right, font=font(10), bg=HEADER)
+        self.lbl_discovery.pack(anchor="e", pady=(2, 0))
 
     def _build_toolbar(self):
         bar = tk.Frame(self.root, bg=BG)
@@ -525,7 +555,22 @@ class TeacherApp:
         sec = max(0, int(sec))
         return f"{sec // 60:02d}:{sec % 60:02d}"
 
+    def _update_discovery(self):
+        if self.server.discovery_error:
+            self.lbl_discovery.config(
+                text=f"автопоиск не работает: {self.server.discovery_error}", fg="#ff9b9b")
+            return
+        seen = set(self.server.discovery_seen)
+        # 127.0.0.1 — этот же компьютер, он уже посчитан по сетевому адресу
+        n = len({ip for ip in seen if not ip.startswith("127.")}) or len(seen)
+        self.lbl_discovery.config(
+            text=f"автопоиск включён · искали с {n} "
+                 f"{plural(n, 'компьютера', 'компьютеров', 'компьютеров')}" if n
+            else "автопоиск включён · запросов от курсантов пока не было",
+            fg="#8fd6a8")
+
     def refresh(self):
+        self._update_discovery()
         items, total = self.server.snapshot()
         items.sort(key=lambda kc: (kc[1]["group"].lower(), kc[1]["name"].lower()))
         existing = set(self.tree.get_children())

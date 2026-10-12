@@ -62,6 +62,14 @@ def local_ips():
     return sorted(i for i in ips if not i.startswith("127."))
 
 
+def log(text):
+    """Служебные сообщения — в окно консоли, из которого запущена программа."""
+    try:
+        print(time.strftime("%H:%M:%S"), text, file=sys.stderr, flush=True)
+    except (OSError, ValueError, AttributeError):
+        pass   # запуск без консоли (pythonw) — писать некуда
+
+
 def parse_address(text):
     """«192.168.0.10», «192.168.0.10:5050» или «192.168.0.10 : 5050» → (хост, порт)."""
     text = text.replace(" ", "")
@@ -227,26 +235,44 @@ class TeacherFinder:
     def _targets():
         # общий широковещательный адрес + адрес «x.y.z.255» каждой сети компьютера
         # (с несколькими сетевыми картами Windows шлёт 255.255.255.255 только в одну)
+        # плюс напрямую на каждый адрес этого компьютера (если программа
+        # преподавателя запущена здесь же)
         targets = {"255.255.255.255", "127.0.0.1"}
-        for ip in local_ips():
+        try:
+            ips = local_ips()
+        except Exception as e:      # имя компьютера, которое не разбирается, и т. п.
+            log(f"Автопоиск: не удалось узнать адреса компьютера: {e!r}")
+            ips = []
+        for ip in ips:
+            targets.add(ip)
             targets.add(ip.rsplit(".", 1)[0] + ".255")
-        return targets
+        return sorted(targets)
 
     def _run(self, stop):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.settimeout(0.3)
-        except OSError:
-            return
+            self._loop(stop)
+        except Exception:
+            import traceback
+            log("Автопоиск остановился из-за ошибки:\n" + traceback.format_exc())
+
+    def _loop(self, stop):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.settimeout(0.3)
         query = json.dumps({"type": "discover", "magic": DISCOVERY_MAGIC}).encode("utf-8")
+        failed, answered = set(), set()
+        targets = self._targets()
+        log(f"Автопоиск: ищу преподавателя, запросы на UDP-порт {DISCOVERY_PORT}: "
+            + ", ".join(targets))
         with s:
             while not stop.is_set():
-                for target in self._targets():
+                for target in targets:
                     try:
                         s.sendto(query, (target, DISCOVERY_PORT))
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        if target not in failed:
+                            failed.add(target)
+                            log(f"Автопоиск: не удалось отправить на {target}: {e}")
                 until = time.monotonic() + self.INTERVAL
                 while not stop.is_set() and time.monotonic() < until:
                     try:
@@ -254,8 +280,10 @@ class TeacherFinder:
                         msg = json.loads(data.decode("utf-8"))
                     except socket.timeout:
                         continue
-                    except (OSError, ValueError):
+                    except (OSError, ValueError) as e:
                         # Windows сообщает «порт недоступен» на прошлую отправку — не страшно
+                        if not isinstance(e, ConnectionResetError):
+                            log(f"Автопоиск: ошибка приёма: {e!r}")
                         time.sleep(0.05)
                         continue
                     if not (isinstance(msg, dict) and msg.get("magic") == DISCOVERY_MAGIC
@@ -268,6 +296,9 @@ class TeacherFinder:
                                  "started": bool(msg.get("started"))}
                     except (KeyError, TypeError, ValueError):
                         continue
+                    if (found["id"], addr[0]) not in answered:
+                        answered.add((found["id"], addr[0]))
+                        log(f"Автопоиск: ответил преподаватель {addr[0]} — «{found['title']}»")
                     self.on_found(found)
 
 
