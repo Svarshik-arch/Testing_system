@@ -1116,6 +1116,9 @@ class CadetApp:
         elif t == "_closed":
             if m.get("sock") is not self.sock or self.finished:
                 return
+            if self._connecting:
+                self._handshake_failed()
+                return
             self._drop_socket()
             if self.locked:
                 self._start_reconnect()
@@ -1126,6 +1129,12 @@ class CadetApp:
             if self.locked and now - self._last_key_toast > 1.5:
                 self._last_key_toast = now
                 self.toast("Это сочетание клавиш недоступно во время теста", "warn")
+        elif t in ("wait", "test", "finished") and self._connecting:
+            self._connecting = False      # ответила программа преподавателя
+            self._cancel("handshake")
+            self.finder.stop()
+            log(f"Подключено к преподавателю {self.address[0]}:{self.address[1]}")
+            self.handle(m)
         elif t == "wait":
             self.show_wait(m.get("title", ""))
         elif t == "test":
@@ -1154,18 +1163,34 @@ class CadetApp:
             except OSError:
                 pass
             return
-        self._connecting = False
         self.sock = sock
         self.finished = False
         threading.Thread(target=self.reader, args=(sock,), daemon=True).start()
         self.send({"type": "hello", "name": self.form["name"], "group": self.form["group"]})
         if purpose == "login":
-            self.finder.stop()
-            self.show_wait()
+            # «Подключено» покажем, только когда ответит именно программа
+            # преподавателя (на том же порту может сидеть чужая программа)
+            self.later("handshake", 5000, self._handshake_failed)
         else:
             self._stop_reconnect()
             self.close_modal()
             self.toast("Связь восстановлена", "ok")
+
+    def _handshake_failed(self):
+        """Соединение есть, но программа преподавателя так и не ответила."""
+        if not self._connecting:
+            return
+        self._cancel("handshake")
+        self._drop_socket()
+        self._connecting = False
+        host, port = self.address
+        log(f"По адресу {host}:{port} ответила не программа преподавателя")
+        if self.screen == "login":
+            self.btn_connect.set_enabled(True)
+            self.btn_connect.config(text="Подключиться")
+            self._login_error(f"По адресу {host}:{port} работает какая-то другая программа, "
+                              "а не программа преподавателя. Проверьте адрес; если он верный — "
+                              "перезапустите программу преподавателя.")
 
     # ---------- потеря связи во время теста ----------
     def _start_reconnect(self):

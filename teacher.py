@@ -140,11 +140,34 @@ class TestServer:
         self.instance_id = uuid.uuid4().hex   # чтобы студент не увидел одного учителя дважды
 
     # ---------- запуск ----------
-    def start_listening(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", self.port))
-        self.sock.listen(100)
+    def start_listening(self, spare_ports=0):
+        """Занимает TCP-порт для подключения студентов.
+
+        Если порт занят другой программой, пробует следующие (spare_ports
+        штук) — студенты узнают настоящий порт через автопоиск.
+        """
+        last_error = None
+        for port in range(self.port, self.port + spare_ports + 1):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if sys.platform != "win32":
+                # на Linux — чтобы сразу перезапускаться после закрытия; на Windows
+                # этот флаг позволил бы делить порт с чужой программой, и её
+                # подключения «уводили» бы студентов
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+                s.listen(100)
+            except OSError as e:
+                s.close()
+                last_error = e
+                log(f"TCP-порт {port} занят ({e})" +
+                    (", пробую следующий" if port < self.port + spare_ports else ""))
+                continue
+            self.sock, self.port = s, port
+            log(f"Жду подключения студентов на TCP-порту {port}")
+            break
+        else:
+            raise last_error
         threading.Thread(target=self._accept_loop, daemon=True).start()
         self._start_discovery()
 
@@ -908,10 +931,12 @@ def launch(root):
 
     server = TestServer(test, port)
     try:
-        server.start_listening()
+        # порт, заданный вручную, не меняем; стандартный — при занятости сдвигаем
+        server.start_listening(spare_ports=0 if len(sys.argv) > 2 else 9)
     except OSError as e:
         messagebox.showerror("Ошибка", f"Не удалось открыть порт {port}:\n{e}\n\n"
-                                       "Возможно, программа уже запущена.")
+                                       "Возможно, программа уже запущена или порт занят "
+                                       "другой программой.")
         return root.destroy()
 
     root.deiconify()
