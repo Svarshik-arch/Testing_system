@@ -15,7 +15,9 @@ import time
 import tkinter as tk
 
 DEFAULT_PORT = 5050
-DISCOVERY_PORT = 5050            # UDP-порт для поиска преподавателя в сети
+# UDP-порты для поиска преподавателя: он занимает первый свободный из них,
+# поэтому спрашиваем все (номера те же, что в teacher.py)
+DISCOVERY_PORTS = (47615, 47616, 47617)
 DISCOVERY_MAGIC = "testing-system/1"
 
 # ---- оформление (без внешних зависимостей) ----
@@ -262,17 +264,18 @@ class TeacherFinder:
         query = json.dumps({"type": "discover", "magic": DISCOVERY_MAGIC}).encode("utf-8")
         failed, answered = set(), set()
         targets = self._targets()
-        log(f"Автопоиск: ищу преподавателя, запросы на UDP-порт {DISCOVERY_PORT}: "
-            + ", ".join(targets))
+        log("Автопоиск: ищу преподавателя, UDP-порты "
+            + ", ".join(map(str, DISCOVERY_PORTS)) + ", адреса: " + ", ".join(targets))
         with s:
             while not stop.is_set():
                 for target in targets:
-                    try:
-                        s.sendto(query, (target, DISCOVERY_PORT))
-                    except OSError as e:
-                        if target not in failed:
-                            failed.add(target)
-                            log(f"Автопоиск: не удалось отправить на {target}: {e}")
+                    for port in DISCOVERY_PORTS:
+                        try:
+                            s.sendto(query, (target, port))
+                        except OSError as e:
+                            if target not in failed:
+                                failed.add(target)
+                                log(f"Автопоиск: не удалось отправить на {target}: {e}")
                 until = time.monotonic() + self.INTERVAL
                 while not stop.is_set() and time.monotonic() < until:
                     try:

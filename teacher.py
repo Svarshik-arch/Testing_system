@@ -17,7 +17,9 @@ import uuid
 from tkinter import filedialog, messagebox, ttk
 
 DEFAULT_PORT = 5050
-DISCOVERY_PORT = 5050            # UDP-порт, на котором студенты ищут преподавателя
+# UDP-порты автопоиска: программа преподавателя занимает первый свободный,
+# студенты спрашивают все. Редкие номера — чтобы не мешали другие программы.
+DISCOVERY_PORTS = (47615, 47616, 47617)
 DISCOVERY_MAGIC = "testing-system/1"
 
 # Вход в программу преподавателя. В коде хранится не сам пароль, а его хеш
@@ -148,16 +150,22 @@ class TestServer:
 
     def _start_discovery(self):
         """Отвечает на широковещательный запрос студентов «кто проводит тест?»."""
-        try:
-            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            exclusive_port(u)
-            u.bind(("0.0.0.0", DISCOVERY_PORT))
-        except OSError as e:
+        for port in DISCOVERY_PORTS:
+            try:
+                u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                exclusive_port(u)
+                u.bind(("0.0.0.0", port))
+                break
+            except OSError as e:
+                u.close()
+                log(f"Автопоиск: UDP-порт {port} занят другой программой ({e}), пробую следующий")
+        else:
             # без автопоиска студенты введут адрес вручную
-            self.discovery_error = str(e)
-            log(f"Автопоиск НЕ запущен: не удалось занять UDP-порт {DISCOVERY_PORT}: {e}")
+            self.discovery_error = "все порты автопоиска заняты другими программами"
+            log("Автопоиск НЕ запущен: заняты все UDP-порты " +
+                ", ".join(map(str, DISCOVERY_PORTS)))
             return
-        log(f"Автопоиск запущен: жду запросы студентов на UDP-порту {DISCOVERY_PORT}")
+        log(f"Автопоиск запущен: жду запросы студентов на UDP-порту {port}")
         threading.Thread(target=self._discovery_loop, args=(u,), daemon=True).start()
 
     def _discovery_loop(self, u):
