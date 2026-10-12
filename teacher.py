@@ -439,7 +439,7 @@ class FlatButton(tk.Label):
 
 class TeacherApp:
     COLS = ("name", "group", "status", "progress", "correct", "grade",
-            "viol", "current", "time", "addr")
+            "current", "time", "addr")
     STATUSES = ("Ожидает", "Тестирует", "Завершил", "Отключён")
     CHIP_NAMES = {"Ожидает": "Ожидают", "Тестирует": "Тестируют",
                   "Завершил": "Завершили", "Отключён": "Отключены"}
@@ -552,7 +552,7 @@ class TeacherApp:
         heads = {"name": ("ФИО", 250, "w"), "group": ("Группа", 90, "center"),
                  "status": ("Статус", 130, "w"), "progress": ("Прогресс", 170, "w"),
                  "correct": ("Верно", 70, "center"), "grade": ("Оценка", 75, "center"),
-                 "viol": ("Нарушения", 120, "center"), "current": ("Вопрос", 75, "center"),
+                 "current": ("Вопрос", 75, "center"),
                  "time": ("Время", 75, "center"), "addr": ("IP", 120, "center")}
         self.tree = ttk.Treeview(card, columns=self.COLS, show="headings", selectmode="browse")
         for col, (text, w, anchor) in heads.items():
@@ -564,7 +564,6 @@ class TeacherApp:
         self.tree.pack(side="left", fill="both", expand=True)
         for st in self.STATUSES:
             self.tree.tag_configure(st, background=ROW_COLORS[st])
-        self.tree.tag_configure("viol", foreground=DANGER)
         self.tree.bind("<Double-1>", self.on_details)
         self.tree.bind("<Return>", self.on_details)
 
@@ -575,9 +574,7 @@ class TeacherApp:
                  "сама найдёт этот компьютер в сети. Если не нашла,\n"
                  f"студент нажимает «Указать адрес вручную» и вводит  {self.address}")
 
-        tk.Label(self.root, text="Двойной клик по студенту — его ответы.   "
-                                 "«Нарушения» — сколько раз студент уходил из окна теста; "
-                                 "«обрыв» — пропадала связь с его компьютером.",
+        tk.Label(self.root, text="Двойной клик по студенту — его ответы.",
                  font=font(10), bg=BG, fg=MUTED).pack(anchor="w", padx=24, pady=(8, 12))
 
     # ---------- обновление ----------
@@ -621,13 +618,10 @@ class TeacherApp:
             score, _tot, _pct, grade = self.server.result(c)
             if c["finished"]:
                 grades.append(grade)
-            viol = str(c["violations"]) if c["violations"] else ""
-            if c["drops"]:
-                viol = (viol + " · " if viol else "") + f"обрыв {c['drops']}"
             values = (c["name"], c["group"], f"●  {st}", progress,
                       score if c["t_start"] is not None else "",
-                      grade if c["finished"] else "—", viol, cur, elapsed, c["addr"])
-            tags = (st,) + (("viol",) if c["violations"] or c["drops"] else ())
+                      grade if c["finished"] else "—", cur, elapsed, c["addr"])
+            tags = (st,)
             if iid in existing:
                 self.tree.item(iid, values=values, tags=tags)
                 existing.discard(iid)
